@@ -9,23 +9,101 @@ from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
-st.set_page_config(page_title="KILUNGA'S Budget", page_icon="💰", layout="centered")
+st.set_page_config(page_title="MY Budget", page_icon="💰", layout="centered")
 
 # ---------- Mipangilio ----------
 DATA_DIR = Path("data")
 USERS_DIR = DATA_DIR / "users"
-USERS_DIR.mkdir(parents=True, exist_ok=True)
 USERS_FILE = DATA_DIR / "users.json"
 LEGACY_DB = DATA_DIR / "budget.json"  # data za toleo la zamani (mtumiaji mmoja)
 CATS = ["NEEDS", "WANTS", "SAVINGS"]
 DEFAULT_GOALS = {"NEEDS": 50, "WANTS": 30, "SAVINGS": 20}  # asilimia
 MAX_TRIES = 5        # majaribio ya PIN kabla ya akaunti kufungwa kwa muda
 LOCK_SECONDS = 300   # dakika 5
+MIN_PIN = 6          # urefu wa chini wa PIN kwa akaunti mpya
 TOLERANCE = 5        # pointi za asilimia kwa alama ya 🟡
 WARN_RATIO = 0.8     # onyo ukifika 80% ya kikomo
 MONTH_RE = r"\d{4}-(0[1-9]|1[0-2])"
+
+
+def _secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
+
+
+# Ukiweka SUPABASE_URL na SUPABASE_KEY kwenye Secrets, app inahifadhi data mtandaoni.
+# Bila hizo, inahifadhi kwenye faili za folda ya data (kama kwenye laptop).
+SUPABASE_URL = _secret("SUPABASE_URL")
+SUPABASE_KEY = _secret("SUPABASE_KEY")
+CLOUD = bool(SUPABASE_URL and SUPABASE_KEY)
+if not CLOUD:
+    USERS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- Hifadhi ya mtandaoni (Supabase REST) ----------
+def _headers():
+    h = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if not str(SUPABASE_KEY).startswith("sb_"):  # funguo za zamani (JWT) zinahitaji Bearer
+        h["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    return h
+
+
+def _endpoint():
+    return str(SUPABASE_URL).rstrip("/") + "/rest/v1/store"
+
+
+def _cloud_fail():
+    st.error("Hifadhi ya data haipatikani kwa sasa. Jaribu tena baada ya dakika chache.")
+    st.stop()
+
+
+def kv_get(key, default=None):
+    try:
+        r = requests.get(_endpoint(), headers=_headers(),
+                         params={"key": f"eq.{key}", "select": "value"}, timeout=15)
+        r.raise_for_status()
+        rows = r.json()
+    except requests.RequestException:
+        _cloud_fail()
+    return rows[0]["value"] if rows else default
+
+
+def kv_set(key, value):
+    h = _headers()
+    h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    try:
+        r = requests.post(_endpoint(), headers=h, params={"on_conflict": "key"},
+                          json={"key": key, "value": value}, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException:
+        _cloud_fail()
+
+
+def kv_create(key, value):
+    """Huunda tu kama ufunguo haupo. Inarudisha False kama tayari upo."""
+    h = _headers()
+    h["Prefer"] = "return=minimal"
+    try:
+        r = requests.post(_endpoint(), headers=h, json={"key": key, "value": value}, timeout=15)
+        if r.status_code == 409:
+            return False
+        r.raise_for_status()
+    except requests.RequestException:
+        _cloud_fail()
+    return True
+
+
+def kv_delete(key):
+    try:
+        r = requests.delete(_endpoint(), headers=_headers(), params={"key": f"eq.{key}"}, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException:
+        _cloud_fail()
 
 
 # ---------- Zana za faili ----------
@@ -57,22 +135,80 @@ def user_file(name):
     return USERS_DIR / f"{name}.json"
 
 
-def register(name, pin):
+# --- Akaunti (salt, hash, majaribio) ---
+def get_creds(name):
+    if CLOUD:
+        return kv_get(f"acct:{name}")
+    return read_json(USERS_FILE, {}).get(name)
+
+
+def set_creds(name, creds):
+    if CLOUD:
+        kv_set(f"acct:{name}", creds)
+    else:
+        users = read_json(USERS_FILE, {})
+        users[name] = creds
+        write_json(USERS_FILE, users)
+
+
+def create_creds(name, creds):
+    """True kama akaunti imeundwa, False kama jina tayari lipo."""
+    if CLOUD:
+        return kv_create(f"acct:{name}", creds)
     users = read_json(USERS_FILE, {})
     if name in users:
-        return "Jina hili tayari linatumika. Chagua jingine."
-    salt = secrets.token_hex(16)
-    users[name] = {"salt": salt, "hash": hash_pin(pin, salt), "fails": 0, "locked_until": 0}
+        return False
+    users[name] = creds
     write_json(USERS_FILE, users)
-    # Mtumiaji wa kwanza anarithi data za toleo la zamani (kama zipo)
-    if len(users) == 1 and LEGACY_DB.exists():
+    return True
+
+
+def delete_creds(name):
+    if CLOUD:
+        kv_delete(f"acct:{name}")
+    else:
+        users = read_json(USERS_FILE, {})
+        users.pop(name, None)
+        write_json(USERS_FILE, users)
+
+
+# --- Data za bajeti za kila mtumiaji ---
+def load_db(name):
+    if CLOUD:
+        return kv_get(f"data:{name}", {})
+    return read_json(user_file(name), {})
+
+
+def save_db(name, data):
+    if CLOUD:
+        kv_set(f"data:{name}", data)
+    else:
+        write_json(user_file(name), data)
+
+
+def delete_db(name):
+    if CLOUD:
+        kv_delete(f"data:{name}")
+    else:
+        f = user_file(name)
+        if f.exists():
+            f.unlink()
+
+
+def register(name, pin):
+    first_local = (not CLOUD) and not read_json(USERS_FILE, {})
+    salt = secrets.token_hex(16)
+    creds = {"salt": salt, "hash": hash_pin(pin, salt), "fails": 0, "locked_until": 0}
+    if not create_creds(name, creds):
+        return "Jina hili tayari linatumika. Chagua jingine."
+    # Kwenye laptop, mtumiaji wa kwanza anarithi data za toleo la zamani (kama zipo)
+    if first_local and LEGACY_DB.exists():
         user_file(name).write_text(LEGACY_DB.read_text(encoding="utf-8"), encoding="utf-8")
     return None
 
 
 def login(name, pin):
-    users = read_json(USERS_FILE, {})
-    u = users.get(name)
+    u = get_creds(name)
     if not u:
         return "Jina au PIN si sahihi."
     now = time.time()
@@ -80,37 +216,34 @@ def login(name, pin):
         mins = int((u["locked_until"] - now) // 60) + 1
         return f"Akaunti imefungwa kwa muda. Jaribu tena baada ya dakika {mins}."
     if hmac.compare_digest(hash_pin(pin, u["salt"]), u["hash"]):
-        u["fails"] = 0
-        u["locked_until"] = 0
-        write_json(USERS_FILE, users)
+        if u.get("fails") or u.get("locked_until"):
+            u["fails"] = 0
+            u["locked_until"] = 0
+            set_creds(name, u)
         return None
     u["fails"] = u.get("fails", 0) + 1
     if u["fails"] >= MAX_TRIES:
         u["fails"] = 0
         u["locked_until"] = now + LOCK_SECONDS
-    write_json(USERS_FILE, users)
+    set_creds(name, u)
     return "Jina au PIN si sahihi."
 
 
 def verify(name, pin):
-    u = read_json(USERS_FILE, {}).get(name)
+    u = get_creds(name)
     return bool(u) and hmac.compare_digest(hash_pin(pin, u["salt"]), u["hash"])
 
 
 def change_pin(name, new_pin):
-    users = read_json(USERS_FILE, {})
+    u = get_creds(name)
     salt = secrets.token_hex(16)
-    users[name].update({"salt": salt, "hash": hash_pin(new_pin, salt)})
-    write_json(USERS_FILE, users)
+    u.update({"salt": salt, "hash": hash_pin(new_pin, salt)})
+    set_creds(name, u)
 
 
 def delete_account(name):
-    users = read_json(USERS_FILE, {})
-    users.pop(name, None)
-    write_json(USERS_FILE, users)
-    f = user_file(name)
-    if f.exists():
-        f.unlink()
+    delete_creds(name)
+    delete_db(name)
 
 
 # ---------- Skrini ya kuingia ----------
@@ -134,13 +267,15 @@ if "user" not in st.session_state:
     with tab_reg:
         with st.form("register"):
             un = st.text_input("Chagua jina la mtumiaji (herufi ndogo, namba au _ ; 3-20)").strip().lower()
-            p1 = st.text_input("PIN (angalau tarakimu 4)", type="password")
+            p1 = st.text_input(f"PIN (angalau herufi au tarakimu {MIN_PIN})", type="password")
             p2 = st.text_input("Rudia PIN", type="password")
+            st.caption("Ukisahau PIN hakuna njia ya kuirejesha, kwa hiyo pakua CSV mara kwa mara. "
+                       "Mmiliki wa app anaweza kuona data zilizohifadhiwa.")
             if st.form_submit_button("Fungua akaunti"):
                 if not valid_username(un):
                     st.error("Jina lazima liwe herufi ndogo (a-z), namba au _, urefu 3 hadi 20.")
-                elif len(p1) < 4:
-                    st.error("PIN iwe na angalau tarakimu 4.")
+                elif len(p1) < MIN_PIN:
+                    st.error(f"PIN iwe na angalau herufi au tarakimu {MIN_PIN}.")
                 elif p1 != p2:
                     st.error("PIN hazilingani.")
                 else:
@@ -154,8 +289,7 @@ if "user" not in st.session_state:
 
 # ---------- Mtumiaji ameingia ----------
 user = st.session_state.user
-DB_FILE = user_file(user)
-db = read_json(DB_FILE, {})
+db = load_db(user)
 
 # Mipangilio ya mtumiaji (malengo na vikomo) inakaa kwenye "_settings"
 settings = db.setdefault("_settings", {})
@@ -166,7 +300,7 @@ limits = settings.get("limits", {})
 
 
 def save():
-    write_json(DB_FILE, db)
+    save_db(user, db)
 
 
 def summarize(mdata):
@@ -501,12 +635,12 @@ with t_set:
     with st.expander("🔐 Akaunti yangu"):
         st.write("**Badilisha PIN**")
         old = st.text_input("PIN ya sasa", type="password", key="old_pin")
-        new = st.text_input("PIN mpya (angalau tarakimu 4)", type="password", key="new_pin")
+        new = st.text_input(f"PIN mpya (angalau herufi au tarakimu {MIN_PIN})", type="password", key="new_pin")
         if st.button("Hifadhi PIN mpya"):
             if not verify(user, old):
                 st.error("PIN ya sasa si sahihi.")
-            elif len(new) < 4:
-                st.error("PIN mpya iwe na angalau tarakimu 4.")
+            elif len(new) < MIN_PIN:
+                st.error(f"PIN mpya iwe na angalau herufi au tarakimu {MIN_PIN}.")
             else:
                 change_pin(user, new)
                 st.success("PIN imebadilishwa.")
