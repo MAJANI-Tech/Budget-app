@@ -250,6 +250,7 @@ def delete_account(name):
 if "user" not in st.session_state:
     st.title("💰 MY Budget")
     st.caption("Fuatilia mapato na matumizi yako kwa mfumo wa 50/30/20")
+        st.link_button("💬 Msaada au maoni kwa WhatsApp", "https://wa.me/255762211601?text=Habari%2C%20nina%20maoni%20kuhusu%20MY%20Budget")
     tab_in, tab_reg = st.tabs(["Ingia", "Jisajili"])
 
     with tab_in:
@@ -655,4 +656,4 @@ with t_set:
             else:
                 st.error("PIN si sahihi.")
 
-st.caption("Maoni: WhatsApp 0762211601")
+st.link_button("💬 Tuma maoni kwa WhatsApp", "https://wa.me/255762211601?text=Habari%2C%20nina%20maoni%20kuhusu%20MY%20Budget")
